@@ -1,0 +1,12 @@
+ (time (nearest-overlap w1 w2))
+Starting search - initial path 148887 long
+Candidate #S(COORD :ROW -250 :COL -30) distance 280
+Evaluation took:
+  266.793 seconds of real time
+  266.718750 seconds of total run time (266.718750 user, 0.000000 system)
+  99.97% CPU
+  638,702,499,661 processor cycles
+  14,873,088 bytes consed
+
+280
+#S(COORD :ROW -250 :COL -30)
