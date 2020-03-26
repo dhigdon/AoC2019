@@ -1,19 +1,24 @@
+;;; INTCODE interpreter
+
 (require 'hadt)
+
+;;; INTCODE reading
 
 (defun parse-intcode (s)
   "Parse a string of comma separated integers into a simple vector of those integers"
-  (let ((code (hadt:make-queue)) 
-        (slen (length s))
-        (idx 0))
-    (loop
-      (cond ((< idx slen)
-             (multiple-value-bind (op next) (parse-integer s :start idx :junk-allowed t)
-               (assert (or (= next slen) (char= #\, (aref s next))))
-               (hadt:enqueue op code)
-               (setf idx (1+ next))))
-            (t (return (coerce (hadt:queue-flatten code) 'vector)))))))
+  (declare (simple-string s))
+  (let* ((slen (length s))
+         (code (make-array slen :element-type 'integer :adjustable t :fill-pointer 0)))
+    (declare (fixnum slen) ((vector integer) code))
+    (do
+      ((idx 0 idx))
+      ((>= idx slen)
+       (copy-seq code))
+      (multiple-value-bind (op next) (parse-integer s :start idx :junk-allowed t)
+        (vector-push-extend op code (- slen idx))
+        (setf idx (1+ next))))))
 
-;; Intcode CPU
+;; INTCODE CPU
 
 ;;; Addressing mode
 (deftype adr-mode () `(ftype (function (simple-vector fixnum fixnum) fixnum)))
@@ -24,56 +29,62 @@
 (defun adr-mode-imm (mem val base) (progn mem base val))
 (defun adr-mode-rel (mem val base) (svref mem (+ base val)))
 
-(declaim (adr-mode dst-mode-pos dst-mode-imm dst-mode-rel))
+(declaim (adr-mode dst-mode-pos dst-mode-rel))
 (defun dst-mode-pos (mem val base) mem base val)
-(defun dst-mode-imm (mem val base) mem val base (error 'immediate))
+;; note, there is no immediate destination mode
 (defun dst-mode-rel (mem val base) mem (+ base val))
 
-(defun opcode-adr-mode (opcode len outlen)
-  (let ((result (make-array (+ len outlen)))
+(defun opcode-adr-mode (opcode inlen outlen)
+  (declare (fixnum opcode inlen outlen))
+  (let ((result (make-array (+ inlen outlen)))
         (modes (floor opcode 100))
         (mode 0))
-    (dotimes (i len)
+    ;; Decode the adr modes
+    (dotimes (i inlen)
       (multiple-value-setq (modes mode) (floor modes 10))
       (setf (svref result i)
             (case mode
               (0 #'adr-mode-pos)
               (1 #'adr-mode-imm)
-              (2 #'adr-mode-rel))))
+              (2 #'adr-mode-rel)
+              (otherwise (error "~A is not a valid adr-mode" mode)))))
     ;; Now, decode the dst modes
     (dotimes (i outlen)
       (multiple-value-setq (modes mode) (floor modes 10))
-      (setf (svref result (+ i len))
+      (setf (svref result (+ i inlen))
             (case mode
               (0 #'dst-mode-pos)
-              (1 #'dst-mode-imm)
-              (2 #'dst-mode-rel))))
-    (unless (zerop modes) (error 'bad-adr-mode-decode))
-    result))
+              (2 #'dst-mode-rel)
+              (otherwise (error "~A is not a valid dst-mode" mode)))))
+    (if (zerop modes)
+      result
+      (error "Bad adr-mode-decode ~A" opcode))))
 
 (defparameter *trace-intcode* nil)
 
 ;; The running state of the interpreter
 (defstruct interp
-  (memory   #()   :type simple-vector)
+  (memory   #()   :type (array integer))
   (pc       0     :type fixnum)
   (base     0     :type fixnum)
   (halted   nil   :type (or nil symbol))
   (input    (hadt:make-queue))
   (output   (hadt:make-queue)))
 
-
+(declaim (ftype (function (interp) fixnum) interp-opcode))
 (defun interp-opcode (interp)
   "Fetch the opcode at the current PC"
   (svref (interp-memory interp)
          (interp-pc interp)))
 
+(declaim (ftype (function (interp fixnum) fixnum) interp-advance interp-jump))
 (defun interp-advance (interp n) (incf (interp-pc interp) n))
 (defun interp-jump (interp n) (setf (interp-pc interp) n))
 
 (defun interp-param (interp index modes)
   "Return the value of the zero-indexed opcode parameter, in light of the
   addressing mode supplied"
+  (declare (interp interp) (fixnum index) (simple-vector modes))
   (let ((mem (interp-memory interp))
         (adr (+ 1 (interp-pc interp) index)))
     (funcall (svref modes index)
@@ -81,48 +92,50 @@
 
 (defun interp-set-mem (interp address value)
   "Store the value in the location the opcode's field at index indicates.
-  Note that destinations are always addresses, never immediate values"
+  Note that destinations are always addresses, never immediate values,
+  and values can be bignums or any integer."
+  (declare (interp interp) (fixnum address) (integer value))
   (setf (svref (interp-memory interp) address) value))
 
-(defun interp-add-input (interp val)
-  (hadt:enqueue val (interp-input interp)))
+;;; Input is handled by way of a queue
+(defun interp-add-input (interp val)   (hadt:enqueue val (interp-input interp))) 
+(defun interp-read (interp)            (hadt:dequeue (interp-input interp))) 
+(defun interp-has-input (interp)       (not (hadt:queue-empty-p (interp-input interp)))) 
+(defun interp-write (interp val)       (hadt:enqueue val (interp-output interp))) 
+(defun interp-read-output (interp)     (hadt:dequeue (interp-output interp)))
 
-(defun interp-read (interp)
-  (hadt:dequeue (interp-input interp)))
-
-(defun interp-has-input (interp)
-  (not (hadt:queue-empty-p (interp-input interp))))
-
-(defun interp-write (interp val)
-  (hadt:enqueue val (interp-output interp)))
-
-(defun interp-read-output (interp)
-  (hadt:dequeue (interp-output interp)))
-
-(defun interp-trace (interp name len outlen)
+(defun interp-trace (interp name inlen outlen)
+  "Disassemble the current opcode, given a name and the operand counts"
   (when *trace-intcode*
     (format t "~4A ~A(~A)" (interp-pc interp) name (interp-opcode interp))
-    (let ((mode (opcode-adr-mode (interp-opcode interp) len outlen)))
-      (dotimes (i len)    (format t " ~A" (interp-param interp i mode)))
-      (dotimes (i outlen) (format t " [~A]" (interp-param interp (+ i len) mode))))
+    (let ((mode (opcode-adr-mode (interp-opcode interp) inlen outlen)))
+      (dotimes (i inlen)  (format t " ~A" (interp-param interp i mode)))
+      (dotimes (i outlen) (format t " [~A]" (interp-param interp (+ i inlen) mode))))
     (format t "~%")))
 
-(defun interp-retire (interp name len outlen dest val)
+(defun interp-retire (interp name inlen outlen dest val)
   "Retire the current opcode named 'name and advance the PC to the next opcode.
-  len = the number of input fields in the opcode
+  inlen = the number of input fields in the opcode
   outlen = the number of output fields (either 0 or 1)
   dest = address to store the opcode's result, or nil of no value is written
   val  = the opcode's value"
-  (interp-trace interp name len outlen)
+  (declare (interp interp) (string name) (fixnum inlen outlen dest) (integer val))
+  (interp-trace interp name inlen outlen)
   (when (> outlen 0) (interp-set-mem interp dest val))
-  (interp-advance interp (+ 1 len outlen)))
+  (interp-advance interp (+ 1 inlen outlen)))
+
 
 (defun interp-step (interp)
   "Advance the interpreter through one instruction"
+  (declare (interp interp))
   (let ((opcode (interp-opcode interp))
         (pc (interp-pc interp)))
+    (declare (fixnum opcode pc))
     (case (mod opcode 100)
       (1  ;; ADD
+       ;; I am sure that there is a way to abstract this pattern,
+       ;; but this is good enough for now. Knowing me, I'll wind
+       ;; up replacing this with something more "macro-y" in the future.
        (let* ((mode (opcode-adr-mode opcode 2 1))
               (op1  (interp-param interp 0 mode))
               (op2  (interp-param interp 1 mode))
@@ -208,9 +221,7 @@
        pc)
 
       (otherwise
-        (format t "Bad opcode ~4A ~A~%" pc opcode)
-        (error 'interp-step))))
-  )
+        (error "Bad opcode ~4A ~A~%" pc opcode)))))
 
 (defun interp-eval (interp)
   "Run the interpreter until it halts"
@@ -220,10 +231,18 @@
       (when (interp-halted interp)
         (return)))))
 
+(defun copy-intcode (icode memsize)
+  "Create a copy of icode, possibly expanded to memsize extra bytes.
+  Copied image does not include a fill pointer or the ability to resize."
+  (declare (simple-vector icode) (fixnum memsize))
+  (let ((result (make-array (max (length icode) memsize))))
+    (dotimes (idx (length icode) result)
+      (setf (aref result idx) (aref icode idx)))))
+
 (defun interp-run (icode &key (memsize 2048))
   "Run the intcode in the provided vector, and return a new
   memory image with the results."
-  (let ((interp (make-interp :memory (adjust-array (copy-seq icode) (max (length icode) memsize)))))
+  (let ((interp (make-interp :memory (copy-intcode icode memsize))))
     (loop
       ;; If the program is blocking, process that halted state.
       (case (interp-halted interp)
@@ -231,7 +250,7 @@
         (exit  (return)))
 
       (interp-step interp)
-      
+
       ;; Display output as soon as possible - this is an interactive run
       (dolist (out (hadt:queue-flatten (interp-output interp)))
         (format t "Out: ~A~%" out)))
