@@ -18,6 +18,11 @@
         (vector-push-extend op code (- slen idx))
         (setf idx (1+ next))))))
 
+(defun load-intcode (filename)
+  "Read the first line of code in the file and parse it as an INTCODE program"
+  (with-open-file (s filename)
+    (parse-intcode (read-line s))))
+
 ;; INTCODE CPU
 
 ;;; Addressing mode
@@ -101,8 +106,10 @@
 (defun interp-add-input (interp val)   (hadt:enqueue val (interp-input interp))) 
 (defun interp-read (interp)            (hadt:dequeue (interp-input interp))) 
 (defun interp-has-input (interp)       (not (hadt:queue-empty-p (interp-input interp)))) 
+
 (defun interp-write (interp val)       (hadt:enqueue val (interp-output interp))) 
 (defun interp-read-output (interp)     (hadt:dequeue (interp-output interp)))
+(defun interp-has-output (interp)      (not (hadt:queue-empty-p (interp-output interp))))
 
 (defun interp-trace (interp name inlen outlen)
   "Disassemble the current opcode, given a name and the operand counts"
