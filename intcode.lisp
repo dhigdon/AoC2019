@@ -95,12 +95,15 @@
     (funcall (svref modes index)
              mem (svref mem adr) (interp-base interp))))
 
-(defun interp-set-mem (interp address value)
-  "Store the value in the location the opcode's field at index indicates.
-  Note that destinations are always addresses, never immediate values,
-  and values can be bignums or any integer."
+(defun interp-poke (interp address value)
+  "Store the value in the interpreter's memory at the given address."
   (declare (interp interp) (fixnum address) (integer value))
   (setf (svref (interp-memory interp) address) value))
+
+(defun interp-peek (interp address)
+  "Returns the value stored in the given address of the interpreter"
+  (declare (interp interp) (fixnum address))
+  (svref (interp-memory interp) address))
 
 ;;; Input is handled by way of a queue
 (defun interp-add-input (interp val)   (hadt:enqueue val (interp-input interp))) 
@@ -128,7 +131,7 @@
   val  = the opcode's value"
   (declare (interp interp) (string name) (fixnum inlen outlen dest) (integer val))
   (interp-trace interp name inlen outlen)
-  (when (> outlen 0) (interp-set-mem interp dest val))
+  (when (> outlen 0) (interp-poke interp dest val))
   (interp-advance interp (+ 1 inlen outlen)))
 
 
