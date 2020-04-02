@@ -6,29 +6,33 @@
 
 ;;; Data conversion - parse the rules
 
-(defun tokenize (s)
-  (split-sequence #\Space (remove #\, s)))
+(defstruct rule
+  (reactant nil :type symbol)
+  (quantity 0   :type integer))
 
 (defun parse-rule (num name)
-  (cons (intern name) (parse-integer num)))
+  "Make a rule from the two strings provided"
+  (declare (string num name))
+  (make-rule
+    :reactant (intern name)
+    :quantity (parse-integer num)))
 
-(defun make-reactant (r q) (cons r q))
-(defun rule-reactant (r) (car r))
-(defun rule-quantity (r) (cdr r))
-
-;;; -------------------------------------------------------------------
+(defun tokenize (s)
+  (declare (string s))
+  (split-sequence #\Space (remove #\, s)))
 
 (defun parse-reaction (s)
   "Takes an input string of the form
   <int> <id>[, <int> <id>]* => <int> <id>
   And returns a list with
   ( (name . num) (list (name . num) ...) )"
+  (declare (string s))
   (let ((tokens (tokenize (string-right-trim '(#\Newline #\Return) s)))
         (reactants '())
         (product nil))
     (do ()
       ((null tokens)
-       (list product (reverse reactants)))
+       (list product (nreverse reactants)))
       (cond ((string= "=>" (car tokens))
              (pop tokens)
              (setq product
@@ -49,11 +53,10 @@
         (let* ((reaction (parse-reaction l))
                (inputs   (cdr reaction))
                (product  (car reaction))
-               (reactant (car product))
-               (produced (cdr product)))
+               (reactant (rule-reactant product))
+               (produced (rule-quantity product)))
           (push reactant reactants)
-          (setf (gethash reactant reactions)
-                (cons produced inputs)))))))
+          (setf (gethash reactant reactions) (cons produced inputs)))))))
 
 (defun show-reactions (table)
   (loop for x being the hash-values of table using (hash-key k)
@@ -61,39 +64,48 @@
 
 ;;; -------------------------------------------------------------------
 
-(defstruct product
-  (total   0 :type integer)
-  (current 0 :type integer))
+(defstruct crucible
+  "A vessel that holds amounts of different reactants.
+  Tracks both current quantities and total amount added."
+  (quantities (make-hash-table) :type hash-table)
+  (totals     (make-hash-table) :type hash-table))
 
-(declaim (ftype (function (hash-table symbol) integer) crucible-quantity crucible-produced)
-         (ftype (function (hash-table symbol integer) product) add-crucible-quantity)
-         (ftype (function (hash-table symbol integer) (or integer null)) use-crucible-quantity))
+(defun new-crucible (size)
+  "Create a new crucible that can hold size elements"
+  (make-crucible
+    :quantities (make-hash-table :size size)
+    :totals     (make-hash-table :size size)))
+
+(declaim (ftype (function (symbol crucible) integer) crucible-total crucible-quantity))
 
 ;; The crucible maps reactants to a record of (produced . consumed)
-(defun crucible-produced (crucible product)
-  "Find the total amount of product that has passed through the crucible"
-  (multiple-value-bind (c found) (gethash product crucible)
-    (if found (product-total c) 0)))
+(defun crucible-total (reactant crucible)
+  "Find the total amount of reactant that has passed through the crucible"
+  (gethash reactant (crucible-totals crucible) 0))
 
-(defun crucible-quantity (crucible product)
-  "Find the current amount of product in the crucible"
-  (multiple-value-bind (c found) (gethash product crucible)
-    (if found (product-current c) 0)))
+(defun crucible-quantity (reactant crucible)
+  "Find the current amount of reactant in the crucible"
+  (gethash reactant (crucible-quantities crucible) 0))
 
-(defun add-crucible-quantity (crucible product q)
-  "Add material to the crucible. Returns the new product record"
-  (multiple-value-bind (c found) (gethash product crucible)
-    (cond (found
-            (incf (product-total c) q)
-            (incf (product-current c) q)
-            c)
-          (t (setf (gethash product crucible) (make-product :total q :current q))))))
+(defun set-crucible-contents (reactant totals contents crucible)
+  "Initialize the crucible's record of this type of material"
+  (setf (gethash reactant (crucible-totals crucible)) totals)
+  (setf (gethash reactant (crucible-quantities crucible)) contents))
 
-(defun use-crucible-quantity (crucible product q)
-  "Use q units of product. Returns NIL if unable to comply"
-  (multiple-value-bind (c found) (gethash product crucible)
-    (when (and found (>= (product-current c) q))
-      (decf (product-current c) q))))
+(defun add-to-crucible (reactant quantity crucible)
+  "Add material to the crucible. Returns the new level of reactant in the crucible." 
+  ;; Note, can't use incf because there may not yet be an entry for this reactant
+  (let ((ht (crucible-totals crucible)))
+    (setf (gethash reactant ht) (+ quantity (gethash reactant ht 0))))
+
+  (let ((ht (crucible-quantities crucible)))
+    (setf (gethash reactant ht) (+ quantity (gethash reactant ht 0)))))
+
+(defun consume-from-crucible (reactant quantity crucible)
+  "Consume a quantity of reactant from the crucible.
+  Returns new reactant amount or NIL if unable to comply"
+  (when (>= (crucible-quantity reactant crucible))
+    (decf (gethash reactant (crucible-quantities crucible)) quantity)))
 
 ;;; -------------------------------------------------------------------
 
@@ -102,43 +114,38 @@
 (defun produce (goal required rules crucible)
   "Produce the goal from elements in the crucible.
   Returns T if able to produce, or NIL otherwise"
-  (declare (symbol goal) (integer required) (hash-table rules crucible))
+  (declare (symbol goal) (integer required) (hash-table rules) (crucible crucible))
 
   (multiple-value-bind (formula found) (gethash goal rules)
 
     (cond 
       ;; If we have enough, we are done
-      ((>= (crucible-quantity crucible goal) required))
+      ((>= (crucible-quantity goal crucible) required))
 
       ;; If we have infinite ore, we can just mine some more
       ((and (eq goal 'ore) *infinite-ore*)
-       (let ((deficit (- required (crucible-quantity crucible goal))))
-         ;(format t "Mining for ~A more ore~%" deficit)
-         (add-crucible-quantity crucible goal deficit)
+       (let ((deficit (- required (crucible-quantity goal crucible))))
+         (add-to-crucible goal deficit crucible)
          t))
 
       ;; If we found some production rules, we can produce what we need.
       (found
-        ;(format t "Producing components to make ~A units of ~A...~%" required goal)
         (let ((produced-quantity (car formula))
-              (production-rules  (cadr formula)))
+              (formula-rules     (cadr formula)))
 
           ;; Run production until we meet our requirements
-          (do () ((>= (crucible-quantity crucible goal) required)
-                  t)
+          (do () ((>= (crucible-quantity goal crucible) required) t)
 
             ;; Run the rules, if any
-            (dolist (rule production-rules)
+            (dolist (rule formula-rules)
               (let ((reactant (rule-reactant rule))
                     (quantity (rule-quantity rule)))
-                ;(format t "  ~A ~A -> ~A ~A~%" quantity reactant required goal)
                 (if (produce reactant quantity rules crucible)
-                  (use-crucible-quantity crucible reactant quantity)
+                  (consume-from-crucible reactant quantity crucible)
                   (return-from produce nil))))
 
             ;; Provide the rule's level of resources
-            ;(format t "Produced ~A units of ~A~%" produced-quantity goal)
-            (add-crucible-quantity crucible goal produced-quantity))))
+            (add-to-crucible goal produced-quantity crucible))))
 
       ;; We don't have enough and we can't make more, so return nil
       (t nil))))
@@ -147,15 +154,12 @@
 
 (defun run (filename &key  ore)
   (multiple-value-bind (reactions reactants) (load-reactions filename)
-    (let ((crucible (make-hash-table :size (length reactants))))
-      ;; Clear the crucible's contents
-      ;; NOTE: crucible contains a pair of (produced . consumed)
+    (let ((crucible (new-crucible (length reactants)))
+          (*infinite-ore* (not (numberp ore))))
 
-      ;; We start off with one trillion units of ore
-      (if (numberp ore)
-        (setf (gethash 'ore crucible) (make-product :total ore :current ore)
-              *infinite-ore* nil)
-        (setf *infinite-ore* t))
+      ;; If specified, then load our initial ore into the crucible
+      (when (numberp ore)
+        (set-crucible-contents 'ore ore ore crucible))
 
       ;; Produce our fuel
       (unless (produce 'fuel 1 reactions crucible)
@@ -163,8 +167,8 @@
 
       ;; Report fuel generated and ore consumed
       (when *infinite-ore*
-        (format t "Ore consumed = ~A~%" (gethash 'ore crucible)))
-      (format t "Fuel produced = ~A~%" (gethash 'fuel crucible))
+        (format t "Ore consumed = ~A~%" (crucible-total 'ore crucible)))
+      (format t "Fuel produced = ~A~%" (crucible-quantity 'fuel crucible))
 
       ;; The result is our crucible full of products and byproducts
       crucible)))
@@ -173,17 +177,17 @@
 
 (defun crucible-empty (crucible exceptions)
   (maphash #'(lambda (k v)
-               (unless (or (zerop (product-current v))
-                           (member k exceptions))
+               (unless (or (zerop v) (member k exceptions))
                  (return-from crucible-empty nil)))
-           crucible)
+           (crucible-quantities crucible))
   t)
 
 
 (defun do-consume (ore reactions crucible)
   "How much fuel can you make from the given parameter?"
-  (declare (integer ore) (hash-table reactions crucible))
-  (setf (gethash 'ore crucible) (make-product :total ore :current ore))
+  (declare (integer ore) (hash-table reactions) (crucible crucible))
+
+  (set-crucible-contents 'ore ore ore crucible)
 
   ;; Produce our fuel
   (let ((total-fuel 0))
@@ -192,28 +196,25 @@
         (return total-fuel))
 
       ;; Consume our fuel
-      (use-crucible-quantity crucible 'fuel 1)
+      (consume-from-crucible 'fuel 1 crucible)
       (incf total-fuel)
 
       (when (crucible-empty crucible '(ore))
         ;; We have returns to a steady state
         ;; Compute how many times we can do this again with the amount
         ;; of ore we have remaining
-        ;(format t "Found a cycle ~A fuel units long~%" total-fuel)
-        (let ((used-ore (- ore (crucible-quantity crucible 'ore))))
+        (let ((used-ore (- ore (crucible-quantity 'ore crucible))))
           (multiple-value-bind (runs leftovers) (floor ore used-ore)
-            ;(format t "~A ore used, ~A runs, ~A leftovers~%" used-ore runs leftovers)
-            (return-from
-              do-consume
-              (if (zerop leftovers)
-                (* runs total-fuel)
-                (+ (* runs total-fuel)
-                   (do-consume leftovers reactions crucible))))))))))
+            (return-from do-consume
+                         (if (zerop leftovers)
+                           (* runs total-fuel)
+                           (+ (* runs total-fuel)
+                              (do-consume leftovers reactions crucible))))))))))
 
 
 (defun consume (filename ore)
   (multiple-value-bind (reactions reactants) (load-reactions filename)
-    (let ((crucible (make-hash-table :size (length reactants)))
+    (let ((crucible (new-crucible (length reactants)))
           (*infinite-ore* (null ore)))
       (do-consume ore reactions crucible))))
 
