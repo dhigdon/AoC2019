@@ -1,5 +1,6 @@
 ;;; INTCODE interpreter
 
+(ql:quickload :str)
 (require 'hadt)
 
 ;;; INTCODE reading
@@ -256,7 +257,7 @@
     (loop
       ;; If the program is blocking, process that halted state.
       (case (interp-halted interp)
-        (input (interp-add-input interp (parse-integer (string-trim " " (read-line)))))
+        (input (interp-add-input interp (parse-integer (str:trim (read-line)))))
         (exit  (return)))
 
       (interp-step interp)
